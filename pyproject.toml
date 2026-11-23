@@ -1,6 +1,6 @@
 [project]
 name = "video-consumer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Turn a video into a transcript + screenshot digest package for agent consumption"
 requires-python = ">=3.11"
 dependencies = [

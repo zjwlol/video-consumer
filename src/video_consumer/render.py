@@ -17,11 +17,16 @@ def render_markdown(title:str, source_name:str, duration_ms:int, model_name:str|
   lines = [f"# {title}", "", f"- Source: {source_name} | Duration: {fmt_ts(duration_ms)}",
            f"- Transcribed: {transcribed} | Frames: {sum(1 for section in sections if section.frame)}",
            f"- Generated: {datetime.now().isoformat(timespec='seconds')}", ""]
+  speech_end_ms = 0
   for section in sections:
     lines += [f"## [{fmt_ts(section.start_ms)} – {fmt_ts(section.end_ms)}]", ""]
     if section.frame: lines += [f"![{section.frame.id}](frames/{section.frame.path.name})", ""]
-    lines += [" ".join(segment.text for segment in section.segments) if section.segments else "*[no speech]*", ""]
-  out_md.write_text("\n".join(lines))
+    if section.segments:
+      lines += [" ".join(segment.text for segment in section.segments), ""]
+      speech_end_ms = max(speech_end_ms, *(segment.end_ms for segment in section.segments))
+    elif speech_end_ms > section.start_ms: lines += ["*[speech continues from the previous section]*", ""]
+    else: lines += ["*[no speech]*", ""]
+  out_md.write_text("\n".join(lines), encoding="utf-8")
   return out_md
 
 def render_manifest(source_name:str, duration_ms:int, model_name:str|None, settings:FrameSettings,
@@ -35,5 +40,5 @@ def render_manifest(source_name:str, duration_ms:int, model_name:str|None, setti
                   "segments":[{"start_ms":segment.start_ms, "end_ms":segment.end_ms, "text":segment.text}
                               for segment in section.segments]} for section in sections],
   }
-  out_json.write_text(json.dumps(manifest, indent=2))
+  out_json.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
   return out_json

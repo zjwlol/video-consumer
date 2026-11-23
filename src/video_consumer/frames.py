@@ -1,22 +1,24 @@
 """Stage 3: select, extract, and deduplicate representative video frames."""
 from __future__ import annotations
-import math, re, subprocess
+import bisect, math, re, subprocess
 from dataclasses import dataclass
 from pathlib import Path
 import imagehash
 from PIL import Image
+
+FRAME_FILE = re.compile(r"\d{3,}_\d{4,}\.jpg")
 
 @dataclass
 class Frame:
   id:str
   t_ms:int
   path:Path
-  trigger:str  # "scene" or "interval"
+  trigger:str  # "scene", "settle" or "interval"
   scene_score:float = 0.0
 
 @dataclass
 class FrameSettings:
-  scene_threshold:float = 0.10
+  scene_threshold:float = 0.02
   min_gap_s:float = 10.0
   max_gap_s:float = 90.0
   frame_width:int = 640
@@ -37,19 +39,32 @@ def detect_scene_changes(video:Path, threshold:float, verbose=False) -> list[tup
   return candidates
 
 def select_timestamps(scene_candidates:list[tuple[int, float]], duration_ms:int, settings:FrameSettings) -> list[tuple[int, str, float]]:
-  """Apply the min-gap, scene cap, and interval fallback rules."""
+  """Apply the min-gap, scene cap, settle, and interval fallback rules."""
   min_gap_ms, max_gap_ms = int(settings.min_gap_s*1000), int(settings.max_gap_s*1000)
   opening = (min(1000, duration_ms//2), "interval", 0.0)  # t=0 is often black or incomplete
-  scenes:list[tuple[int, str, float]] = []
-  last_t = opening[0]
-  for t_ms,score in sorted(scene_candidates):
-    if t_ms-last_t >= min_gap_ms:
-      scenes.append((t_ms, "scene", score))
-      last_t = t_ms
-  budget = settings.max_frames or max(1, duration_ms//20_000)  # opening and gap-fill anchors are extra
-  if len(scenes) > budget: scenes = sorted(sorted(scenes, key=lambda frame:frame[2], reverse=True)[:budget])
+  budget = settings.max_frames or max(1, duration_ms//20_000)  # opening, settle and gap-fill frames are extra
+  by_time = sorted(candidate for candidate in scene_candidates if candidate[0] > opening[0])
+  kept_t, scenes = [opening[0]], []
+  # strongest change first so a small change cannot block a big one inside the same min gap
+  for t_ms,score in sorted(by_time, key=lambda candidate:candidate[1], reverse=True):
+    if len(scenes) == budget: break
+    i = bisect.bisect_left(kept_t, t_ms)
+    if t_ms-kept_t[i-1] < min_gap_ms: continue
+    if i < len(kept_t) and kept_t[i]-t_ms < min_gap_ms: continue
+    kept_t.insert(i, t_ms)
+    scenes.append((t_ms, "scene", score))
+  anchors = [opening] + sorted(scenes)
+  times = [t_ms for t_ms,_ in by_time]
+  settled:list[tuple[int, str, float]] = []
+  for i,anchor in enumerate(anchors):
+    settled.append(anchor)
+    settle_t = anchor[0]+min_gap_ms
+    later = bisect.bisect_right(times, anchor[0])
+    changed_again = later < len(times) and times[later] < settle_t
+    next_is_far = i+1 == len(anchors) or anchors[i+1][0]-settle_t >= min_gap_ms
+    if changed_again and next_is_far and settle_t < duration_ms: settled.append((settle_t, "settle", 0.0))
   filled:list[tuple[int, str, float]] = []
-  boundaries = [opening] + scenes + [(duration_ms, "end", 0.0)]
+  boundaries = settled + [(duration_ms, "end", 0.0)]
   for i,cur in enumerate(boundaries[:-1]):
     filled.append(cur)
     gap_start, gap_end = cur[0], boundaries[i+1][0]
@@ -62,22 +77,36 @@ def _frame_id(seq:int, t_ms:int) -> str:
   total_s = t_ms//1000
   return f"{seq:03d}_{total_s//60:02d}{total_s%60:02d}"
 
-def extract_frames(video:Path, timestamps:list[tuple[int, str, float]], frames_dir:Path, settings:FrameSettings, duration_ms:int,
-                   verbose=False) -> list[Frame]:
+def clear_frames(frames_dir:Path):
+  """Delete the frame JPEGs of an earlier run and leave every other file alone."""
+  if not frames_dir.is_dir(): return
+  for path in frames_dir.iterdir():
+    if FRAME_FILE.fullmatch(path.name) and path.is_file(): path.unlink()
+
+def _extract_frame(video:Path, t_ms:int, out:Path, frame_width:int, verbose=False) -> str|None:
+  """Write one scaled JPEG and return the ffmpeg error text when no frame came out."""
+  cmd = ["ffmpeg", "-y", "-ss", f"{t_ms/1000:.3f}", "-i", str(video), "-frames:v", "1", "-vf", f"scale={frame_width}:-2",
+         "-q:v", "4", "-update", "1", str(out)]
+  result = subprocess.run(cmd, capture_output=not verbose, text=True)
+  if result.returncode == 0 and out.is_file(): return None
+  out.unlink(missing_ok=True)
+  return result.stderr[-500:] if result.stderr else "(see output above)"
+
+def extract_frames(video:Path, timestamps:list[tuple[int, str, float]], frames_dir:Path, settings:FrameSettings, verbose=False) -> list[Frame]:
   """Extract one scaled JPEG for each selected timestamp."""
   frames_dir.mkdir(parents=True, exist_ok=True)
-  frames = []
+  frames, skipped = [], []
   for seq,(t_ms,trigger,score) in enumerate(timestamps, start=1):
     out = frames_dir/f"{(frame_id:=_frame_id(seq, t_ms))}.jpg"
-    cmd = ["ffmpeg", "-y", "-ss", f"{t_ms/1000:.3f}", "-i", str(video), "-frames:v", "1", "-vf", f"scale={settings.frame_width}:-2",
-           "-q:v", "4", "-update", "1", str(out)]
-    result = subprocess.run(cmd, capture_output=not verbose, text=True)
-    if result.returncode != 0 or not out.is_file():
-      if t_ms >= duration_ms-2000:  # some containers have no decodable frame at their reported endpoint
-        out.unlink(missing_ok=True)
-        continue
-      raise RuntimeError(f"frame extraction failed at {t_ms/1000:.1f}s: {result.stderr[-500:] if result.stderr else '(see output above)'}")
+    error = _extract_frame(video, t_ms, out, settings.frame_width, verbose)
+    # a video track shorter than the opening time still has a first frame
+    if error is not None and seq == 1: error = _extract_frame(video, 0, out, settings.frame_width, verbose)
+    if error is not None:
+      if seq == 1: raise RuntimeError(f"frame extraction failed at {t_ms/1000:.1f}s: {error}")
+      skipped.append(t_ms)  # the video track can end before the audio does or end on a broken frame
+      continue
     frames.append(Frame(id=frame_id, t_ms=t_ms, path=out, trigger=trigger, scene_score=score))
+  if skipped: print(f"  ffmpeg gave no frame at {len(skipped)} timestamps from {skipped[0]/1000:.1f}s on, skipped (run with -v to see why)")
   return frames
 
 def _mean_rgb(img:Image.Image) -> tuple[float, float, float]:
@@ -86,12 +115,14 @@ def _mean_rgb(img:Image.Image) -> tuple[float, float, float]:
   return tuple(sum(pixel[channel] for pixel in pixels)/len(pixels) for channel in range(3))
 
 def dedupe_frames(frames:list[Frame], phash_distance:int) -> list[Frame]:
-  """Delete frames perceptually identical to the previously kept frame."""
+  """Delete interval frames perceptually identical to the previously kept frame."""
   kept:list[Frame] = []
   prev_hash, prev_rgb = None, None
   for frame in frames:
     with Image.open(frame.path) as img: frame_hash, frame_rgb = imagehash.phash(img), _mean_rgb(img)
-    if prev_hash is not None and (frame_hash-prev_hash) <= phash_distance and max(abs(a-b) for a,b in zip(frame_rgb, prev_rgb)) < 12:
+    duplicate = prev_hash is not None and (frame_hash-prev_hash) <= phash_distance and max(abs(a-b) for a,b in zip(frame_rgb, prev_rgb)) < 12
+    # scene and settle frames follow a scored change and phash cannot tell two text slides apart
+    if duplicate and frame.trigger == "interval":
       frame.path.unlink()
       continue
     prev_hash, prev_rgb = frame_hash, frame_rgb
@@ -109,7 +140,7 @@ def build_frames(video:Path, duration_ms:int, frames_dir:Path, settings:FrameSet
   candidates = detect_scene_changes(video, settings.scene_threshold, verbose)
   if verbose: print(f"  scene candidates: {len(candidates)}")
   timestamps = select_timestamps(candidates, duration_ms, settings)
-  frames = extract_frames(video, timestamps, frames_dir, settings, duration_ms, verbose)
+  frames = extract_frames(video, timestamps, frames_dir, settings, verbose)
   before = len(frames)
   frames = dedupe_frames(frames, settings.phash_distance)
   if verbose and before != len(frames): print(f"  dedupe: {before} -> {len(frames)}")
